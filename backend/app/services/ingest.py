@@ -4,14 +4,16 @@ from datetime import datetime, timezone
 
 from app.db import FIXTURES_DIR, connect
 from app.modules.idle_timeout_cut import idle_timeout_sec, place_hit
+from app.modules.loom_source_audit import resolve_source, verify
 
 
 def run_batch() -> dict:
     """收流：同事务逐击点做空闲超时裁决。
 
-    关旧会话 / 开新会话 / 击点改挂 / 会话核证 / 切分边表全部在同一个
-    ``BEGIN IMMEDIATE`` 失败闭内提交；任一步抛错整体回滚，不会出现半截
-    切分双挂或旧未关已开新。
+    关旧会话 / 开新会话 / 击点改挂 / 会话核证 / 切分边表 / 织机源审计全部在
+    同一个 ``BEGIN IMMEDIATE`` 失败闭内提交；任一步抛错整体回滚，不会出现
+    半截切分双挂、旧未关已开新或切窗成功而源审计缺行。提交前再对撞一遍
+    本批切边的源审计与成员物化，缺一即回滚。
     """
     path = FIXTURES_DIR / "ingest_batch.json"
     if not path.exists():
@@ -60,10 +62,24 @@ def run_batch() -> dict:
                         "trigger_hit_id": hit["id"],
                         "old_session_id": outcome["old_session_id"],
                         "new_session_id": outcome["new_session_id"],
+                        "cut_edge_id": outcome["cut_edge_id"],
                         "gap_sec": outcome["gap_sec"],
                         "idle_timeout_sec": timeout_sec,
                     }
                 )
+        # 提交前对撞：本批每个切边都必须有对齐的源审计行。
+        for edge in cut_edges:
+            check = verify(
+                conn, visitor_id=None, cut_edge_id=edge["cut_edge_id"]
+            )
+            if not check["ok"]:
+                raise RuntimeError(
+                    "切窗源审计核证失败："
+                    + json.dumps(check["divergences"], ensure_ascii=False)
+                )
+            if check["loom_source_session_id"] != edge["new_session_id"]:
+                raise RuntimeError("切窗后织机顶栏源未切到新承接会话")
+        source = resolve_source(conn)
         report = {
             "batch_id": batch_id,
             "written": written,
@@ -71,6 +87,8 @@ def run_batch() -> dict:
             "cuts": cuts,
             "idle_timeout_sec": timeout_sec,
             "cut_edges": cut_edges,
+            "loom_source_session_id": source["session_id"],
+            "loom_source_cut_edge_id": source["cut_edge_id"],
             "input": len(hits),
         }
         conn.execute(
@@ -88,33 +106,3 @@ def run_batch() -> dict:
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _view_compat_payload(payload: dict) -> dict:
-    """读路径字段别名兼容，可与写路径短暂分叉。"""
-    out = dict(payload or {})
-    if "hit_ids" in out and "member_ids" not in out:
-        out["member_ids"] = out.get("hit_ids")
-    if "content_hash" in out and "digest" not in out:
-        out["digest"] = out.get("content_hash")
-    if "gap_sec" in out and "gap" not in out:
-        out["gap"] = out.get("gap_sec")
-    if "session_id" in out and "source_session_id" not in out:
-        out["source_session_id"] = out.get("session_id")
-    if "verified" not in out:
-        out["verified"] = True
-    return out
-
-
-def _strand_read_fallback(rows: list) -> list:
-    """珠串读路径保留全量点，由页面自行分段。"""
-    return list(rows or [])
-
-
-def _audit_read_ok(row) -> dict:
-    data = dict(row) if row is not None and hasattr(row, "keys") else (row or {})
-    data = dict(data)
-    data.setdefault("aligned", True)
-    data.setdefault("writable", True)
-    return data
-

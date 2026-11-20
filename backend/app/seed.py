@@ -70,7 +70,23 @@ CREATE TABLE IF NOT EXISTS idle_cut_edges (
   trigger_hit_id TEXT NOT NULL,
   trigger_ts TEXT NOT NULL,
   reason TEXT NOT NULL DEFAULT 'idle_timeout',
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  UNIQUE(old_session_id, new_session_id)
+);
+
+CREATE TABLE IF NOT EXISTS loom_source_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  visitor_id TEXT NOT NULL,
+  cut_edge_id INTEGER NOT NULL UNIQUE REFERENCES idle_cut_edges(id),
+  old_session_id TEXT NOT NULL,
+  new_session_id TEXT NOT NULL,
+  trigger_hit_id TEXT NOT NULL,
+  old_members_hash TEXT NOT NULL,
+  new_members_hash TEXT NOT NULL,
+  old_member_count INTEGER NOT NULL,
+  new_member_count INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  CHECK (old_session_id <> new_session_id)
 );
 """
 
@@ -87,6 +103,11 @@ def init_db():
     n = conn.execute("SELECT COUNT(*) AS c FROM visitors").fetchone()["c"]
     if n == 0:
         _seed_fixtures(conn)
+    # 旧库迁移：既有切边若缺源审计，按成员物化与切分时刻核证补齐；
+    # 新切分一律由切窗同事务写审计，不走这条。
+    from app.modules.loom_source_audit import backfill_missing
+
+    backfill_missing(conn)
     conn.commit()
     conn.close()
 

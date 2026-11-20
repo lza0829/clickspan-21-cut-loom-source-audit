@@ -9,13 +9,20 @@ open 会话。
 
 提交形态（择一之「收流同事务」）：本模块所有写操作只使用调用方传入的
 连接、不自行开关事务；由收流在同一个 ``BEGIN IMMEDIATE`` 事务内完成
-关旧 / 开新 / 改挂 / 会话核证 / 切分边表，任何一步失败整体回滚，杜绝
-半截切分双挂或旧未关已开新。
+关旧 / 开新 / 改挂 / 会话核证 / 切分边表 / 织机源审计，任何一步失败整体
+回滚，杜绝半截切分双挂或旧未关已开新。
+
+切窗成功即同事务重挂源审计：``_cut_to_new_session`` 在关旧、开新、写切边、
+两侧成员核证之后立刻调用 :mod:`app.modules.loom_source_audit`
+:func:`record_cut_source`，写不出审计行就抛错回滚，不存在「切边已落而源审计
+缺行」的成功切窗。
 """
 
 import json
 import uuid
 from datetime import datetime, timezone
+
+from app.modules.loom_source_audit import record_cut_source
 
 STATUS = "implemented"
 
@@ -123,6 +130,7 @@ def place_hit(conn, hit: dict, timeout_sec: int | None = None) -> dict:
     gap = None
     old_sid = None
     new_sid = None
+    cut_edge_id = None
 
     if open_sess is not None and open_sess["last_hit_ts"] is not None:
         gap = gap_seconds(open_sess["last_hit_ts"], hit_ts)
@@ -132,7 +140,7 @@ def place_hit(conn, hit: dict, timeout_sec: int | None = None) -> dict:
             action = "attach"
         else:
             # 超：同事务先关旧会话、再开新会话承接，写切分边表与双段核证。
-            sid = _cut_to_new_session(
+            sid, cut_edge_id = _cut_to_new_session(
                 conn, open_sess, hit, gap, timeout_sec
             )
             old_sid = open_sess["id"]
@@ -180,18 +188,35 @@ def place_hit(conn, hit: dict, timeout_sec: int | None = None) -> dict:
     ).fetchone()
     _write_proof(conn, sess_row)
 
+    if action == "cut":
+        # 切窗成功必须同事务重挂源审计：写不出审计行即抛错，由收流的
+        # BEGIN IMMEDIATE 整体回滚，绝不留下「切边已落而源审计缺行」。
+        record_cut_source(
+            conn,
+            visitor_id=visitor_id,
+            cut_edge_id=cut_edge_id,
+            old_session_id=old_sid,
+            new_session_id=sid,
+            trigger_hit_id=hit["id"],
+        )
+
     return {
         "action": action,
         "session_id": sid,
         "gap_sec": gap,
         "old_session_id": old_sid,
         "new_session_id": new_sid,
+        "cut_edge_id": cut_edge_id,
         "timeout_sec": timeout_sec,
     }
 
 
-def _cut_to_new_session(conn, open_sess, hit: dict, gap: int, timeout_sec: int) -> str:
-    """同事务内关旧、开新、写切分边表；旧会话补一份封闭核证。"""
+def _cut_to_new_session(conn, open_sess, hit: dict, gap: int, timeout_sec: int):
+    """同事务内关旧、开新、写切分边表；旧会话补一份封闭核证。
+
+    返回 ``(new_session_id, cut_edge_id)``；源审计由 :func:`place_hit` 在
+    触发击点落库与承接会话核证写完之后同事务补写。
+    """
     visitor_id = open_sess["visitor_id"]
     old_sid = open_sess["id"]
     hit_ts = hit["event_ts"]
@@ -217,7 +242,7 @@ def _cut_to_new_session(conn, open_sess, hit: dict, gap: int, timeout_sec: int) 
     )
 
     # 3) 持久切分边表（独立边表形态，禁止只在内存分组）。
-    conn.execute(
+    cur = conn.execute(
         """
         INSERT INTO idle_cut_edges(
           visitor_id, old_session_id, new_session_id,
@@ -236,7 +261,10 @@ def _cut_to_new_session(conn, open_sess, hit: dict, gap: int, timeout_sec: int) 
             now_stamp(),
         ),
     )
-    return new_sid
+    cut_edge_id = int(cur.lastrowid)
+    if not cut_edge_id:
+        raise RuntimeError("空闲切窗：切分边写入后无主键")
+    return new_sid, cut_edge_id
 
 
 def list_cut_edges(conn, visitor_id: str | None = None):
